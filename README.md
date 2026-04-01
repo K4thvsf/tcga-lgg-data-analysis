@@ -22,7 +22,7 @@ Verhaak RG, Hoadley KA, Purdom E, et al.; Cancer Genome Atlas Research Network.
 
 ## Contents
 - `Project NGS.Rmd` — Main R Markdown analysis
-- `docs/index.html` — Rendered HTML report (optional, if added for GitHub Pages)
+- `docs/index.html` — Rendered HTML report 
 
 ## Methods (high level)
 1. Data cleaning and removal of missing/unclassified samples (where applicable)
@@ -67,5 +67,9 @@ rmarkdown::render("Project NGS.Rmd")
 ```
 
 ## Requirements
-- R (
+- R (recommended: recent version)
+- Packages used include: `omicsdata`, `EDASeq`, `edgeR`, `dplyr`, `corrplot`, `pheatmap`, `clusterProfiler`, `ReactomePA`, `enrichplot` (see the Rmd for the full list)
+
+## License
+MIT (see `LICENSE`).
 
