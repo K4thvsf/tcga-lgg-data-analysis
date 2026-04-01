@@ -1,0 +1,1548 @@
+---
+title: "NGS PROJECT"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(omicsdata)
+library(dplyr)
+library(plyr)
+library(EDASeq)
+library(clusterExperiment)
+library(edgeR)
+library(corrplot)
+load("data/TCGA-lgg.RDATA")
+lgg
+```
+```{r}
+#View(lgg)
+clinical_variables<-colData(lgg)
+colnames(clinical_variables) #we extracted the names of the columns of colData(lgg)
+```
+
+```{r}
+vars<-colData(lgg)[,60:110] #selected the clinical variables noted by "paper_xx"
+```
+
+```{r}
+flag<-!is.na(lgg$paper_Pan.Glioma.RNA.Expression.Cluster)
+lgg<-lgg[,flag] #removed NA
+flag2<-!lgg$paper_Pan.Glioma.RNA.Expression.Cluster == "unclassified"
+lgg<-lgg[,flag2] #removed unclassified samples
+lgg$paper_Pan.Glioma.RNA.Expression.Cluster<-droplevels(lgg$paper_Pan.Glioma.RNA.Expression.Cluster, exclude ="unclassified") #removed unclassified level
+summary(lgg$paper_Pan.Glioma.RNA.Expression.Cluster) 
+```
+
+# EXPLORATORY ANALYSES OF RAW EXPRESSION DATA
+
+```{r}
+q<-assay(lgg, "raw_count")
+colnames(q)<-substr(colnames(q),9,12)
+
+qlog<-log1p(q)
+col<-lgg$paper_Pan.Glioma.RNA.Expression.Cluster
+levels(col)
+```
+```{r}
+levels(col)<-c(1:4)
+
+boxplot(qlog,col=as.numeric(col),xlab="sample",ylab="pseudocounts expression",ylim=c(0,40),las=2,cex.axis=0.6)
+legend("top",legend = c("LGr1","LGr2", "LGr3", "LGr4"),col=1:4,bty = "n", pch=20,cex=0.7,ncol=2)
+```
+### MD PLOT
+
+```{r}
+limma::plotMA(qlog,main="", xlab = "M", ylab = "D") #MD plot of gene expression, created with all of the gene expression values of the genes of the samples, in an unsupervised way (without considering the division into subtypes)
+```
+-> we can see a "comma" distribution, indicating that the expression of genes throughout the diff subtypes is not unbiased. To better investigae this, we can create MD plots for each couple of subtypes.
+
+```{r}
+plotRLE(q, outline=FALSE,  las=2,
+        ylab = "RLE", main = "RLE of raw counts", col=col) #RLE before normalization
+```
+### PCA
+
+```{r}
+library(ggfortify)
+lgg.pca<-prcomp(q)
+tmp<-summary(lgg.pca)
+tmp$importance[,1:20]
+autoplot(lgg.pca) 
+```
+we ran the code to plot the PCA on the samples. We identified a possible outlier, but as of now (before the normalization) we cannot say whether it's different because of technical or biological variability. So, we need to normalize the data and then choose whether to remove it (true outlier) or not.
+```{r}
+screeplot(lgg.pca,type=c("lines")) 
+```
+-> elbow point: PC2: we can drop the PC after that
+```{r}
+plotPCA(q, k=2, labels=F, col=as.numeric(col), pch=20)
+legend("topright",legend = c("LGr1","LGr2", "LGr3", "LGr4"),col=1:4,bty = "n", pch=24,cex=0.7,ncol=2)
+```
+-> samples of the 4 sub-types are quite separated, but PC1 and PC2 not perfectly divide them. However, we still need to normalize the data, so it's expected and not concerning.
+
+```{r}
+plotPCA(q, k=3, labels=F, col=as.numeric(col), pch=20)
+```
+PC1 can discern between red points (LGr2) and the other points/sub-types.
+PC2 can distinguish blue points (LGr2), green points (LGr3) and less well it can also separate black dots (LGr1) from the others. However, it cannot separate red points from green points, and black points are partially overlapped with green and blue points.
+PC3 cannot separate any group from the others.
+
+### EVALUATION OF CG CONTENT BIAS
+
+```{r}
+  
+type(lgg@rowRanges@elementMetadata@listData$ensembl_gene_id)
+
+ensid_lgg<-lgg@rowRanges@elementMetadata@listData$ensembl_gene_id
+gc_lgg<-getGeneLengthAndGCContent(ensid_lgg, "hg19",mode="org.db")
+head(gc_lgg)
+length(gc_lgg)
+```
+
+```{r}
+flag2<-!is.na(gc_lgg[,2])
+lgg.sel<-lgg[flag2,]
+gc_lgg<-gc_lgg[flag2,]
+data.lgg<-assay(lgg.sel,"raw_count")
+row.names(data.lgg)<-row.names(gc_lgg)
+length(gc_lgg)
+
+dup.lgg<-duplicated(row.names(data.lgg))
+table(duplicated(row.names(data.lgg)))
+
+gc_lgg<-gc_lgg[!dup.lgg,]
+data.lgg<-data.lgg[!dup.lgg,]
+lgg.sel<-lgg.sel[!dup.lgg,]
+
+dim(gc_lgg)
+```
+```{r}
+gc_bias <- newSeqExpressionSet(data.lgg,
+            phenoData=AnnotatedDataFrame(data.frame(
+                      conditions=factor(1:ncol(data.lgg)), 
+                      row.names=colnames(data.lgg))),
+            featureData=AnnotatedDataFrame(data.frame(
+                      gc=gc_lgg[,2],l=gc_lgg[,1])))
+EDASeq::biasPlot(gc_bias,"gc",ylim=c(0,10),log=TRUE)
+```
+-> there seems to be a bias for cg content. In particular, some samples seem to have higher and lower CG contents. Even though there are not samples deviating drastically from other samples, it's still wiser to apply a withing normalization to remove this possible bias.
+
+
+### filtering before normalization
+
+```{r}
+filter_lgg<-apply(data.lgg,1, function(x) sum(x>=10)) 
+filter_lgg<-filter_lgg>260
+sum(filter_lgg) #elimination of genes with a row count smaller than 10 in at least (almost) half of the samples
+```
+```{r}
+gc_bias<-gc_bias[filter_lgg,]
+lgg.sel<-lgg.sel[filter_lgg,]
+```
+
+## NORMALIZATION STEP
+
+```{r}
+wt = withinLaneNormalization(gc_bias, "gc" , which="upper",offset=TRUE) #within normalization
+
+fq = betweenLaneNormalization(wt, which="full",offset=TRUE) #full quantile between normalization 
+
+lbs <- calcNormFactors(normCounts(wt), method = "RLE") #RLE normalization
+rle <- edgeR::cpm(normCounts(wt), lib.size = lbs * colSums(normCounts(wt))) 
+
+lbs <- calcNormFactors(normCounts(wt), method = "TMM") #tmm normalization
+tmm <- edgeR::cpm(normCounts(wt), lib.size = lbs * colSums(normCounts(wt))) 
+
+tc <- edgeR::cpm(normCounts(wt)) # CPM normalization
+```
+### plotting the results of the normalizations
+
+```{r}
+col<-lgg$paper_Pan.Glioma.RNA.Expression.Cluster
+levels(col)<-c(1:4)
+boxplot(log2(tc+1), outline=FALSE,  las=2,
+        ylab = "log(count+1)", main = "Boxplot Total count",    xaxt='n',col=as.numeric(col))
+```
+```{r}
+boxplot(log2(normCounts(fq)+1), outline=FALSE,  las=2,
+        ylab = "log(count+1)", main = "Boxplot Full Quantile", xaxt='n')
+```
+```{r}
+boxplot(log2(rle+1), outline=FALSE,  las=2,
+        ylab = "log(count+1)", main = "Boxplot RLE", xaxt='n')
+```
+```{r}
+boxplot(log2(tmm+1), outline=FALSE,  las=2,
+        ylab = "log(count+1)", main = "Boxplot TMM", xaxt='n')
+```
+
+### RLE plot after normalization
+
+-> classical plot to confirm whether the normalization was efficient in removing eventual biases
+```{r}
+lgg_levels<-lgg$paper_Pan.Glioma.RNA.Expression.Cluster
+levels(lgg_levels)<-c(1:4)
+```
+1. RLE after CPM
+
+```{r}
+EDASeq::plotRLE(tc, outline=FALSE,  las=2, col=lgg_levels,
+        ylab = "RLE", main = "RLE total count", xaxt='n')
+```
+2.  RLE after full quantile
+
+```{r}
+plotRLE(fq, outline=FALSE,  las=2, col=lgg_levels,
+        ylab = "RLE", main = "RLE full quantile", xaxt='n')
+```
+2. RLE after RLE geometric mean
+
+```{r}
+plotRLE(rle, outline=FALSE, las=2,col=lgg_levels,
+        ylab = "RLE", main = "RLE Geometric Mean", xaxt='n')
+```
+4. RLE after TMM
+
+```{r}
+plotRLE(tmm, outline=FALSE,  las=2,col=lgg_levels,
+        ylab = "RLE", main = "RLE TMM", xaxt='n')
+```
+CONCLUSION: both CPM and the full quantile seem to fail in normalizing the data, while both RLE and TMM appear efficient. The RLE seems however to line better the median of the boxplots around 0
+
+### correlation plot
+
+```{r}
+colnames(rle)<-substr(colnames(rle),9,12)
+m<-cor(log1p(rle))
+
+corrplot(m, method="color",order = 'hclust',tl.cex=0.2)
+```
+## PCA OF NORMALIZED RESULTS
+
+```{r}
+lgg.pca<-prcomp(t(log1p(rle)))
+rle_prcomp<-summary(lgg.pca)
+rle_prcomp$importance[,1:20]
+```
+```{r}
+autoplot(lgg.pca)
+```
+-> the apparetn outlier seen before the normalziation has disappeared
+
+
+```{r}
+screeplot(lgg.pca,type=c("lines"))  
+```
+```{r}
+EDASeq::plotPCA(tc, k=3, labels=F, col=as.numeric(lgg_levels), pch=20)
+```
+```{r}
+EDASeq::plotPCA(fq, k=3, labels=F, col=as.numeric(lgg_levels), pch=20)
+```
+```{r}
+EDASeq::plotPCA(tmm, k=3, labels=F, col=as.numeric(lgg_levels), pch=20)
+```
+```{r}
+EDASeq::plotPCA(rle, k=3, labels=F, col=as.numeric(lgg_levels), pch=20)
+```
+-> the PCA shows that TMM and RLE are the best normalizations for our data. Based also on the results of the RLE plot, we choose RLE as the normalization factor. 
+with this normalization we can see that PC1 can discriminate red points from blue-green-black, while it cannot discriminate between blue and green and can discriminate only partially the black sub-group. On the other hand, PC2 can discriminate between blue-red subgroups and green-black subgroup. 
+In general, moreover, the black subgroup appears to be the worse clustered.
+
+## PLOTTING CG AFTER WT NORMALIZATION 
+
+```{r}
+EDASeq::biasPlot(wt, "gc", ylim=c(0,10), log=TRUE)
+```
+
+
+## INFERENTIAL STEP
+
+we need to compare the 4 subgroups to identify DEGs in each of them. The best way to do so is to build a contrast matrix for each possible pair of groups. So:
+
+```{r}
+design.m_lgg<-model.matrix(~0+lgg.sel$paper_Pan.Glioma.RNA.Expression.Cluster)
+colnames(design.m_lgg)<-c("LGr1", "LGr2", "LGr3", "LGr4")
+head(design.m_lgg)
+```
+### Contrast matrixes
+```{r}
+## we need to define the contrast for each pair of groups, since that is a matrix allowing us to measure the differences between the pairs.
+contrast_Gr1_Gr2<-makeContrasts(
+  "LGr1-LGr2",
+  levels=colnames(design.m_lgg)
+)
+contrast_Gr1_Gr3<-makeContrasts(
+  "LGr1-LGr3",
+  levels=colnames(design.m_lgg)
+)
+contrast_Gr1_Gr4<-makeContrasts(
+  "LGr1-LGr4",
+  levels=colnames(design.m_lgg)
+)
+contrast_Gr2_Gr3<-makeContrasts(
+  "LGr2-LGr3",
+  levels=colnames(design.m_lgg)
+)
+contrast_Gr2_Gr4<-makeContrasts(
+  "LGr2-LGr4",
+  levels=colnames(design.m_lgg)
+)
+contrast_Gr3_Gr4<-makeContrasts(
+  "LGr3-LGr4",
+  levels=colnames(design.m_lgg)
+)
+contrast_Gr1_Gr2
+```
+
+## building the DGE object
+
+```{r}
+dge <- DGEList(normCounts(wt), group= lgg.sel$paper_Pan.Glioma.RNA.Expression.Cluster) #function to change our within normalized data to a DGE object
+dge <- calcNormFactors(dge, method="RLE") #insert the normalization factors inside the object
+dge <- estimateDisp(dge, design.m_lgg) #estimation of dispersion parameters
+
+par(mfrow=c(1,2))
+plotMeanVar(dge, show.raw.vars = TRUE, show.ave.raw.vars = FALSE, NBline = TRUE)
+
+plotMeanVar(dge, show.raw.vars = TRUE, show.ave.raw.vars = FALSE, NBline = TRUE, show.tagwise.vars = TRUE)
+```
+### generalized linear model to  fit our data
+
+```{r}
+#glmFit tires to fit a generalized linear model in our data (design matrix + contrasts). it will return us a vector of estimated beta parameters
+fit_LGr1_LGr2 <- glmFit(dge, design.m_lgg, contrast=contrast_Gr1_Gr2)
+fit_LGr1_LGr3 <- glmFit(dge, design.m_lgg, contrast=contrast_Gr1_Gr3)
+fit_LGr1_LGr4 <- glmFit(dge, design.m_lgg, contrast=contrast_Gr1_Gr4)
+fit_LGr2_LGr3 <- glmFit(dge, design.m_lgg, contrast=contrast_Gr2_Gr3)
+fit_LGr2_LGr4 <- glmFit(dge, design.m_lgg, contrast=contrast_Gr2_Gr4)
+fit_LGr3_LGr4 <- glmFit(dge, design.m_lgg, contrast=contrast_Gr3_Gr4)
+#example of offset
+fit_LGr3_LGr4$offset[,1:20]
+```
+
+### pairwise comparisons
+
+```{r}
+# considering the estiamted beta parameters of the generalized linear model, it performs a statistical test to get the likelihood (LRT: likelihood ratio test) for each beta parameter to be equal to 0.
+library(edgeR)
+res1_2 <- glmLRT(fit_LGr1_LGr2, contrast=contrast_Gr1_Gr2)
+topTags(res1_2,sort.by="logFC") #topTags sort the results based on the given input (here, logFC)
+table(decideTestsDGE(res1_2))
+```
+
+```{r}
+res1_3 <- glmLRT(fit_LGr1_LGr3, contrast=contrast_Gr1_Gr3)
+topTags(res1_3,sort.by="logFC")
+table1_3<-table(decideTestsDGE(res1_3))
+```
+
+```{r}
+res1_4 <- glmLRT(fit_LGr1_LGr4, contrast=contrast_Gr1_Gr4)
+topTags(res1_4,sort.by="PValue")
+table1_4<-table(decideTestsDGE(res1_4))
+```
+```{r}
+res2_3 <- glmLRT(fit_LGr2_LGr3, contrast=contrast_Gr2_Gr3)
+topTags(res2_3,sort.by="logFC")
+table2_3<-table(decideTestsDGE(res2_3))
+```
+
+```{r}
+res2_4 <- glmLRT(fit_LGr2_LGr4, contrast=contrast_Gr2_Gr4)
+topTags(res2_4,sort.by="PValue")
+table2_4<-table(decideTestsDGE(res2_4))
+table2_4
+```
+```{r}
+res3_4 <- glmLRT(fit_LGr3_LGr4, contrast=contrast_Gr3_Gr4)
+topTags(res3_4,sort.by="logFC")
+table3_4<-table(decideTestsDGE(res3_4))
+table3_4
+```
+### filtering for FDR corrected p-values
+
+```{r}
+top1_2 <-topTags(res1_2, n=Inf)$table 
+de1_2 <- top1_2[top1_2$FDR<=0.001,] #->extracted the res elements with an FDR lower than 0.001
+dim(de1_2)
+sorted_top1_2 <- top1_2[order(top1_2$"FDR"), ]
+de_600_genes1_2 <- sorted_top1_2[1:600, ]
+dim(de_600_genes1_2)
+```
+```{r}
+top1_3 <- topTags(res1_3, n=Inf)$table
+de1_3 <- top1_3[top1_3$FDR<=0.001,]
+dim(de1_3)
+sorted_top1_3 <- top1_3[order(top1_3$"FDR"), ]
+de_600_genes1_3 <- sorted_top1_3[1:600, ]
+dim(de_600_genes1_3)
+```
+```{r}
+top1_4 <- topTags(res1_4, n=Inf)$table
+de1_4 <- top1_4[top1_4$FDR<=0.001,]
+dim(de1_4)
+sorted_top1_4 <- top1_4[order(top1_4$"FDR"), ]
+de_600_genes1_4 <- sorted_top1_4[1:600, ]
+dim(de_600_genes1_4)
+```
+```{r}
+top2_3 <- topTags(res2_3, n=Inf)$table
+de2_3 <- top2_3[top2_3$FDR<=0.001,]
+dim(de2_3)
+sorted_top2_3 <- top2_3[order(top2_3$"FDR"), ]
+de_600_genes2_3 <- sorted_top2_3[1:600, ]
+dim(de_600_genes2_3)
+```
+```{r}
+top3_4 <- topTags(res3_4, n=Inf)$table
+de3_4 <- top3_4[top3_4$FDR<=0.001,]
+dim(de3_4)
+sorted_top3_4 <- top3_4[order(top1_4$"FDR"), ]
+de_600_genes3_4 <- sorted_top3_4[1:600, ]
+dim(de_600_genes3_4)
+```
+```{r}
+top2_4 <- topTags(res2_4, n=Inf)$table
+de2_4 <- top2_4[top2_4$FDR<=0.001,]
+dim(de2_4)
+sorted_top2_4 <- top2_4[order(top2_4$"FDR"), ]
+de_600_genes2_4 <- sorted_top2_4[1:600, ]
+dim(de_600_genes2_4)
+```
+## DE names
+```{r}
+names1_2 <- row.names(de_600_genes1_2)
+names1_2[1:20]
+```
+```{r}
+names1_3 <- row.names(de_600_genes1_3)
+names1_3[1:20]
+```
+```{r}
+names1_4 <- row.names(de_600_genes1_4)
+names1_4[1:20]
+```
+```{r}
+names2_3<- row.names(de_600_genes2_3)
+names2_3[1:20]
+```
+```{r}
+names3_4<- row.names(de_600_genes3_4)
+names3_4[1:20]
+```
+```{r}
+names2_4 <- row.names(de_600_genes2_4)
+names2_4[1:20]
+```
+
+### DEGs exploration
+
+```{r}
+plotMD(res1_2)
+plotMD(res1_3)
+plotMD(res1_4)
+plotMD(res2_3)
+plotMD(res2_4)
+plotMD(res3_4)
+```
+
+## last exploratory analysis: p-value distribution
+
+```{r}
+hist(top1_2$PValue, main="edgeR p-values")
+hist(top1_3$PValue, main="edgeR p-values")
+hist(top1_4$PValue, main="edgeR p-values")
+hist(top2_4$PValue, main="edgeR p-values")
+hist(top2_3$PValue, main="edgeR p-values")
+hist(top3_4$PValue, main="edgeR p-values")
+```
+
+###overall DEG
+
+```{r}
+total_DEG_names<-c(names1_2, names1_3, names1_4, names2_3, names2_4, names3_4)
+flag_deg<-match(total_DEG_names, rownames(rle))
+lgg.deg<-rle[flag_deg,]
+dim(lgg.deg)
+```
+
+### HEATMAP and CLUSTERING
+
+```{r}
+library(pheatmap)
+Col.lgg <- data.frame(Classification=lgg.sel$paper_Pan.Glioma.RNA.Expression.Cluster)
+rownames(Col.lgg) <- colnames(lgg.deg)
+
+ann_colors = list(
+    Classification = c("LGr1"="blue", "LGr2"="pink", "LGr3"= "green", "LGr4"= "yellow"))
+heatmap.lgg.clusters <- pheatmap(log1p(lgg.deg), 
+              annotation_col = Col.lgg, 
+              show_colnames = F, 
+              scale = "row",
+              show_rownames = F, 
+              annotation_colors = ann_colors, 
+              drop_levels =T,
+              cutree_cols = 4)
+
+heatmap.lgg.clusters
+
+```
+
+-> we needed to downsize the data used to generate the heatmap, so we selected for each pairwise comparison the genes with  600 lowest FDR adjusted p-values.
+we can appreciate that the heatmap doesn't provide the results we hoped for, since the 4th cluster, even though containing mostly samples of LGr4, also contains samples of the other three groups; at the same time, what we identify as the 2nd group is made by samples that were originally classified as group LGr1 and LGr3; moreover, according to out heatmap the 1st group is made by only 1 sample, which we cannot even appreicate at a first glance.
+
+## CLUSTERING
+
+```{r}
+library(cluster)
+cut <- cutree(heatmap.lgg.clusters$tree_col,k = 4)
+dist.mat <- dist(t(log1p(lgg.deg)))
+plot(silhouette(cut,dist.mat), col=c("blue", "pink","green", "yellow"), border=NA)
+```
+-> 2 groups (LGr2, 3) appear to have a good silhuette index. However, the 3rd group has many elements having negative siluhette indeces, therefore proving it wans't well clustered. Moreover, the fourth group according to our data is made by only 1 sample. 
+this could be due to an unidentified outlier, even though the normalization didn't show that.
+
+## GENE SET ANALYSIS
+
+### ORA method
+
+```{r}
+universo1_2 <- row.names(top1_2) #take the names of the rows of the top1_2
+sign1_2 <- row.names(de1_2[de1_2$PValue<0.05,]) #row
+
+
+universo.entrez1_2 <- mapIds(org.Hs.eg.db,
+                    keys=universo1_2, #Column containing Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+sign.entrez1_2 <- mapIds(org.Hs.eg.db,
+                    keys=sign1_2, #Column containing Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+universo.entrez1_2 <- as.character(universo.entrez1_2)
+sign.entrez1_2 <- as.character(sign.entrez1_2)
+```
+```{r}
+universo1_3 <- row.names(top1_3)
+sign1_3 <- row.names(de1_3[de1_3$PValue<0.05,])
+
+
+universo.entrez1_3 <- mapIds(org.Hs.eg.db,
+                    keys=universo1_3, #Column containing Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+sign.entrez1_3 <- mapIds(org.Hs.eg.db,
+                    keys=sign1_3, #Column containing Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+universo.entrez1_3 <- as.character(universo.entrez1_3)
+sign.entrez1_3 <- as.character(sign.entrez1_3)
+```
+```{r}
+universo1_4 <- row.names(top1_4)
+sign1_4 <- row.names(de1_4[de1_4$PValue<0.05,])
+
+
+universo.entrez1_4 <- mapIds(org.Hs.eg.db,
+                    keys=universo1_4, #Column containing Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+sign.entrez1_4 <- mapIds(org.Hs.eg.db,
+                    keys=sign1_4, #Column containing Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+universo.entrez1_4 <- as.character(universo.entrez1_4)
+sign.entrez1_4 <- as.character(sign.entrez1_4)
+```
+```{r}
+universo2_3 <- row.names(top2_3)
+sign2_3 <- row.names(de2_3[de2_3$PValue<0.05,])
+
+
+universo.entrez2_3 <- mapIds(org.Hs.eg.db,
+                    keys=universo2_3, #Column containing Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+sign.entrez2_3 <- mapIds(org.Hs.eg.db,
+                    keys=sign2_3, #Column containing Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+universo.entrez2_3 <- as.character(universo.entrez2_3)
+sign.entrez2_3 <- as.character(sign.entrez2_3)
+```
+```{r}
+universo2_4 <- row.names(top2_4)
+sign2_4 <- row.names(de2_4[de2_4$PValue<0.05,])
+
+
+universo.entrez2_4 <- mapIds(org.Hs.eg.db,
+                    keys=universo2_4, #Column containing Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+sign.entrez2_4 <- mapIds(org.Hs.eg.db,
+                    keys=sign2_4, #Column containing Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+universo.entrez2_4 <- as.character(universo.entrez2_4)
+sign.entrez2_4 <- as.character(sign.entrez2_4)
+```
+```{r}
+universo3_4 <- row.names(top3_4)
+sign3_4 <- row.names(de3_4[de3_4$PValue<0.05,])
+
+
+universo.entrez3_4 <- mapIds(org.Hs.eg.db,
+                    keys=universo3_4, #Column containing Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+sign.entrez3_4 <- mapIds(org.Hs.eg.db,
+                    keys=sign3_4, #Column containing Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+universo.entrez3_4 <- as.character(universo.entrez3_4)
+sign.entrez3_4 <- as.character(sign.entrez3_4)
+```
+### KEGG pathway
+
+### KEGG1-2
+
+```{r}
+library(clusterProfiler)
+kk1_2 <- enrichKEGG(gene = sign.entrez1_2,
+                 universe = universo.entrez1_2,
+                 organism = 'hsa',
+                 keyType = 'ncbi-geneid',
+                 pvalueCutoff = 0.05,
+                 pAdjustMethod="BH",
+                 )
+fdr <- kk1_2@result$p.adjust
+
+dim(kk1_2@result[fdr < 0.1, 2:6])
+```
+```{r}
+library(kableExtra)
+kable(kk1_2@result[1:10, 2:6])
+```
+-> LGr1 is enriched in cell cycle and DNA replication pathways, suggesting a faster proliferation compared to LGr2. it's also enriched in synaptic veiscles recycling, suggesting a possibly more differentiated nature. it also appears enriched in ribosomes and ribosomes biogenesis, suggesting a more efficient protein synthesis apparatus.
+
+```{r}
+dotplot(kk1_2)
+```
+```{r}
+cnetplot(kk1_2, node_label="category", cex_label_category=0.5)
+```
+
+```{r}
+heatplot(kk1_2, showCategory=10)
+```
+
+```{r}
+library(enrichplot)
+edo1_2 <- pairwise_termsim(kk1_2)
+upsetplot(edo1_2, 8)
+```
+-> tells us in which % of samples one or more pathways (the dots at the bottom) are enriched.
+
+### KEGG1-3
+
+```{r}
+kk1_3 <- enrichKEGG(gene = sign.entrez1_3,
+                 universe = universo.entrez1_3,
+                 organism = 'hsa',
+                 keyType = 'ncbi-geneid',
+                 pvalueCutoff = 0.05,
+                 pAdjustMethod="BH",
+                 )
+fdr <- kk1_3@result$p.adjust
+
+dim(kk1_3@result[fdr < 0.1, 2:6])
+
+kable(kk1_3@result[1:10, 2:6])
+```
+-> these pathways are less easy to explain, since the only one that could be related to tumor samples are the cytokine-cytokine receptor interaction, suggesting a higher presence of inflammation in LGr1 compared to LGr3.
+it could also be that these 2 subgroups are functionally quite similar, therefore preventing us from finding any significative result concerning typical tumoral upregulated pathways.
+
+```{r}
+dotplot(kk1_3)
+```
+
+```{r}
+cnetplot(kk1_3, node_label="category", cex_label_cateogry=0.5)
+```
+```{r}
+heatplot(kk1_3, showCategory=10)
+```
+```{r}
+edo1_3 <- pairwise_termsim(kk1_3)
+upsetplot(edo1_3, 8)
+```
+
+
+### KEGG 1-4
+
+```{r}
+kk1_4 <- enrichKEGG(gene = sign.entrez1_4,
+                 universe = universo.entrez1_4,
+                 organism = 'hsa',
+                 keyType = 'ncbi-geneid',
+                 pvalueCutoff = 0.05,
+                 pAdjustMethod="BH",
+                 )
+fdr <- kk1_4@result$p.adjust
+
+dim(kk1_4@result[fdr < 0.1, 2:6])
+
+kable(kk1_4@result[1:10, 2:6])
+```
+->also here, we have unexpected results. overall, we could say that group 1 compared to group 4 has immune-related pathways more active
+```{r}
+dotplot(kk1_4)
+```
+```{r}
+cnetplot(kk1_4, node_label="category", cex_label_category=0.5)
+```
+```{r}
+heatplot(kk1_4, showCategory=10)
+```
+```{r}
+edo1_4 <- pairwise_termsim(kk1_4)
+upsetplot(edo1_4, 8)
+```
+
+### KEGG 2-4
+
+```{r}
+kk2_4 <- enrichKEGG(gene = sign.entrez2_4,
+                 universe = universo.entrez2_4,
+                 organism = 'hsa',
+                 keyType = 'ncbi-geneid',
+                 pvalueCutoff = 0.05,
+                 pAdjustMethod="BH",
+                 )
+fdr <- kk2_4@result$p.adjust
+
+dim(kk2_4@result[fdr < 0.1, 2:6])
+
+kable(kk2_4@result[1:10, 2:6])
+```
+
+->2 seems to be less undiffernetiated than 4 (enriched in glutamatergic synapses), and also upregulated in motility-related pathways (adhesion, cytoskeleton)
+```{r}
+dotplot(kk2_4)
+```
+```{r}
+cnetplot(kk2_4,node_label="category", cex_label_category=0.5 )
+```
+```{r}
+heatplot(kk2_4, showCategory=10)
+```
+```{r}
+edo2_4<-pairwise_termsim(kk2_4)
+upsetplot(edo2_4, 8)
+```
+
+
+### KEGG 2-3
+
+```{r}
+kk2_3 <- enrichKEGG(gene = sign.entrez2_3,
+                 universe = universo.entrez2_3,
+                 organism = 'hsa',
+                 keyType = 'ncbi-geneid',
+                 pvalueCutoff = 0.05,
+                 pAdjustMethod="BH",
+                 )
+fdr <- kk2_3@result$p.adjust
+
+dim(kk2_3@result[fdr < 0.1, 2:6])
+
+kable(kk2_3@result[1:10, 2:6])
+```
+-> lots of neuronal pathwyas upregulated, suggesting one of the 2 is more differentiated than the other.
+```{r}
+dotplot(kk2_3)
+```
+```{r}
+cnetplot(kk2_3,node_label="category", cex_label_category=0.5 )
+```
+```{r}
+heatplot(kk2_3, showCategory=10)
+```
+```{r}
+edo2_3<-pairwise_termsim(kk2_3)
+upsetplot(edo2_3, 8)
+```
+
+### KEGG 3-4
+
+```{r}
+kk3_4 <- enrichKEGG(gene = sign.entrez3_4,
+                 universe = universo.entrez3_4,
+                 organism = 'hsa',
+                 keyType = 'ncbi-geneid',
+                 pvalueCutoff = 0.05,
+                 pAdjustMethod="BH",
+                 )
+fdr <- kk3_4@result$p.adjust
+
+dim(kk3_4@result[fdr < 0.1, 2:6])
+
+kable(kk3_4@result[1:10, 2:6])
+```
+-> diff immune response
+
+```{r}
+dotplot(kk3_4)
+```
+
+```{r}
+cnetplot(kk3_4,node_label="category", cex_label_category=0.5 )
+```
+
+```{r}
+heatplot(kk3_4, showCategory=10)
+```
+
+```{r}
+edo3_4<-pairwise_termsim(kk3_4)
+upsetplot(edo3_4, 8)
+```
+
+## REACTOME PATHWAYS
+
+### REACTOME 1-2
+
+```{r}
+library(ReactomePA)
+rr1_2<- enrichPathway(gene = sign.entrez1_2,
+                 universe = universo.entrez1_2,
+                 organism = 'human',
+                 pvalueCutoff = 0.15,
+                 pAdjustMethod="BH",
+                  minGSSize = 10,
+                  maxGSSize = 500
+                 )
+fdr <- rr1_2@result$p.adjust
+dim(rr1_2@result[fdr<0.1, 2:6])
+
+rr1_2@result[1:10, 2:6]
+```
+-> also here, between 1 and 2 there is a diff prot synthesis
+```{r}
+dotplot(rr1_2)
+```
+```{r}
+cnetplot(rr1_2, node_label="category", cex_label_category=0.5)
+```
+```{r}
+heatplot(rr1_2, showCategory=10)
+```
+```{r}
+edor1_2 <- pairwise_termsim(rr1_2)
+upsetplot(edor1_2, 5)
+```
+
+### REACTOME 1-3
+
+```{r}
+rr1_3<- enrichPathway(gene = sign.entrez1_3,
+                 universe = universo.entrez1_3,
+                 organism = 'human',
+                 pvalueCutoff = 0.15,
+                 pAdjustMethod="BH",
+                  minGSSize = 10,
+                  maxGSSize = 500
+                 )
+fdr1_3 <- rr1_3@result$p.adjust
+
+dim(rr1_3@result[fdr1_3<0.1, 2:6])
+rr1_3@result[1:10, 2:6]
+```
+-> WE CANNOT DO ANALYSIS ON THIS PAIRWISE COMPARISON SINCE IT RESULTS THAT NO PATHWAY IS DIFFERENTIALLY REGULATED
+
+### REACTOME 1-4
+
+```{r}
+rr1_4<- enrichPathway(gene = sign.entrez1_4,
+                 universe = universo.entrez1_4,
+                 organism = 'human',
+                 pvalueCutoff = 0.15,
+                 pAdjustMethod="BH",
+                  minGSSize = 10,
+                  maxGSSize = 500
+                 )
+fdr1_4 <- rr1_4@result$p.adjust
+
+dim(rr1_2@result[fdr1_4<0.1, 2:6])
+rr1_4@result[1:10, 2:6]
+```
+```{r}
+dotplot(rr1_4)
+```
+
+
+```{r}
+cnetplot(rr1_4, node_label="category", cex_label_category=0.5)
+```
+```{r}
+heatplot(rr1_4, showCategory=10)
+```
+```{r}
+edor1_4 <- pairwise_termsim(rr1_4)
+upsetplot(edor1_4, 8)
+```
+
+### REACTOME 2-3
+
+```{r}
+rr2_3<- enrichPathway(gene = sign.entrez2_3,
+                 universe = universo.entrez2_3,
+                 organism = 'human',
+                 pvalueCutoff = 0.15,
+                 pAdjustMethod="BH",
+                  minGSSize = 10,
+                  maxGSSize = 500
+                 )
+fdr2_3 <- rr2_3@result$p.adjust
+
+dim(rr2_3@result[fdr2_3<0.1, 2:6])
+rr2_3@result[1:10, 2:6]
+```
+-> between 2 and 3 an enrichment in neuronal pathways
+```{r}
+dotplot(rr2_3)
+```
+```{r}
+cnetplot(rr2_3, node_label="category", cex_label_category=0.5)
+```
+```{r}
+heatplot(rr2_3, showCategory=10)
+```
+```{r}
+edor2_3<-pairwise_termsim(rr2_3)
+upsetplot(rr2_3, 8)
+```
+
+###REACTOME 2-4
+
+```{r}
+rr2_4<- enrichPathway(gene = sign.entrez2_4,
+                 universe = universo.entrez2_4,
+                 organism = 'human',
+                 pvalueCutoff = 0.10,
+                 pAdjustMethod="BH",
+                  minGSSize = 10,
+                  maxGSSize = 500
+                 )
+fdr2_4 <- rr2_4@result$p.adjust
+
+dim(rr2_4@result[fdr2_3<0.01, 2:6])
+rr2_4@result[1:10, 2:6]
+```
+```{r}
+dotplot(rr2_4)
+```
+```{r}
+cnetplot(rr2_4, node_label="category", cex_label_category=0.5)
+```
+```{r}
+heatplot(rr2_4, showCategory=15)
+```
+I DON'T KNOW WHY NOTHING SHOWS
+```{r}
+edor2_4<-pairwise_termsim(rr2_4)
+upsetplot(edor2_4, 8)
+```
+
+### REACTOME 3-4
+
+```{r}
+rr3_4<- enrichPathway(gene = sign.entrez3_4,
+                 universe = universo.entrez3_4,
+                 organism = 'human',
+                 pvalueCutoff = 0.15,
+                 pAdjustMethod="BH",
+                  minGSSize = 10,
+                  maxGSSize = 500
+                 )
+fdr3_4 <- rr3_4@result$p.adjust
+
+dim(rr3_4@result[fdr2_3<0.1, 2:6])
+rr3_4@result[1:10, 2:6]
+```
+```{r}
+dotplot(rr3_4)
+```
+```{r}
+cnetplot(rr3_4, node_label="category", cex_label_category=0.5)
+```
+```{r}
+heatplot(rr3_4, showCategory=10)
+```
+```{r}
+edor3_4<-pairwise_termsim(rr3_4)
+upsetplot(edor3_4, 8)
+```
+### GO
+
+## GO1-2
+```{r}
+ego1_2<-enrichGO(
+              gene = sign.entrez1_2,
+              universe = universo.entrez1_2,
+              OrgDb='org.Hs.eg.db',
+              keyType = "ENTREZID",
+              ont = "BP",
+              pvalueCutoff = 0.05,
+              pAdjustMethod = "BH",
+              qvalueCutoff = 0.1,
+              minGSSize = 10,
+              maxGSSize = 500,
+              readable = TRUE,
+              pool = FALSE
+              )
+
+fdr1_2<-ego1_2@result$p.adjust
+
+dim(ego1_2@result[fdr1_2<0.05, 2:6])
+ego1_2@result[1:10,2:6]
+```
+
+```{r}
+dotplot(ego1_2)
+```
+```{r}
+cnetplot(ego1_2, node_label="category", cex_label_category=0.5)
+```
+```{r}
+upsetplot(ego1_2, 5)
+```
+##GO1-3
+
+```{r}
+ego1_3<-enrichGO(
+              gene = sign.entrez1_3,
+              universe = universo.entrez1_3,
+              OrgDb='org.Hs.eg.db',
+              keyType = "ENTREZID",
+              ont = "BP",
+              pvalueCutoff = 0.05,
+              pAdjustMethod = "BH",
+              qvalueCutoff = 0.1,
+              minGSSize = 10,
+              maxGSSize = 500,
+              readable = TRUE,
+              pool = FALSE
+              )
+
+fdr1_3<-ego1_3@result$p.adjust
+
+dim(ego1_3@result[fdr1_3<0.05, 2:6])
+ego1_3@result[1:10,2:6]
+```
+```{r}
+dotplot(ego1_3)
+```
+```{r}
+cnetplot(ego1_3, node_label="category", cex_label_category=0.5)
+```
+```{r}
+upsetplot(ego1_3, 5)
+```
+
+### GO1-4
+
+```{r}
+ego1_4<-enrichGO(
+              gene = sign.entrez1_4,
+              universe = universo.entrez1_4,
+              OrgDb='org.Hs.eg.db',
+              keyType = "ENTREZID",
+              ont = "BP",
+              pvalueCutoff = 0.05,
+              pAdjustMethod = "BH",
+              qvalueCutoff = 0.1,
+              minGSSize = 10,
+              maxGSSize = 500,
+              readable = TRUE,
+              pool = FALSE
+              )
+
+fdr1_4<-ego1_4@result$p.adjust
+
+dim(ego1_4@result[fdr1_4<0.05, 2:6])
+ego1_4@result[1:10,2:6]
+```
+
+```{r}
+dotplot(ego1_4)
+```
+
+```{r}
+cnetplot(ego1_4, node_label="category", cex_label_category=0.5)
+```
+
+
+```{r}
+upsetplot(ego1_4, 5)
+```
+
+### GO2-3
+
+```{r}
+ego2_3<-enrichGO(
+              gene = sign.entrez2_3,
+              universe = universo.entrez2_3,
+              OrgDb='org.Hs.eg.db',
+              keyType = "ENTREZID",
+              ont = "BP",
+              pvalueCutoff = 0.05,
+              pAdjustMethod = "BH",
+              qvalueCutoff = 0.1,
+              minGSSize = 10,
+              maxGSSize = 500,
+              readable = TRUE,
+              pool = FALSE
+              )
+
+fdr2_3<-ego2_3@result$p.adjust
+
+dim(ego2_3@result[fdr2_3<0.05, 2:6])
+ego2_3@result[1:10,2:6]
+```
+
+
+```{r}
+dotplot(ego2_3)
+```
+
+```{r}
+cnetplot(ego2_3, node_label="category", cex_label_category=0.5)
+```
+
+```{r}
+upsetplot(ego2_3, 5)
+```
+
+## GO2-4
+
+```{r}
+ego2_4<-enrichGO(
+              gene = sign.entrez2_4,
+              universe = universo.entrez2_4,
+              OrgDb='org.Hs.eg.db',
+              keyType = "ENTREZID",
+              ont = "BP",
+              pvalueCutoff = 0.05,
+              pAdjustMethod = "BH",
+              qvalueCutoff = 0.1,
+              minGSSize = 10,
+              maxGSSize = 500,
+              readable = TRUE,
+              pool = FALSE
+              )
+
+fdr2_4<-ego2_4@result$p.adjust
+
+dim(ego2_4@result[fdr2_4<0.05, 2:6])
+ego2_4@result[1:10,2:6]
+```
+
+
+```{r}
+dotplot(ego2_4)
+```
+
+```{r}
+cnetplot(ego2_4, node_label="category", cex_label_category=0.5)
+```
+
+```{r}
+upsetplot(ego2_4, 7)
+```
+
+### GO 3-4
+
+```{r}
+ego3_4<-enrichGO(
+              gene = sign.entrez3_4,
+              universe = universo.entrez3_4,
+              OrgDb='org.Hs.eg.db',
+              keyType = "ENTREZID",
+              ont = "BP",
+              pvalueCutoff = 0.05,
+              pAdjustMethod = "BH",
+              qvalueCutoff = 0.1,
+              minGSSize = 10,
+              maxGSSize = 500,
+              readable = TRUE,
+              pool = FALSE
+              )
+
+fdr3_4<-ego3_4@result$p.adjust
+
+dim(ego3_4@result[fdr3_4<0.05, 2:6])
+ego3_4@result[1:10,2:6]
+```
+
+```{r}
+dotplot(ego3_4)
+```
+
+```{r}
+cnetplot(ego3_4, node_label="category", cex_label_category=0.5)
+```
+
+```{r}
+upsetplot(ego3_4, 5)
+```
+## GSEA
+
+### GSEA kegg 1-2
+
+```{r}
+tt1_2 <- top1_2$logFC
+names(tt1_2) <- universo.entrez1_2
+
+tt1_2<-tt1_2[!duplicated(names(tt1_2))]
+
+gg1_2 <- gseKEGG(geneList = sort(tt1_2, decreasing = TRUE),
+              organism = "hsa",
+              minGSSize = 10,
+              pvalueCutoff = 0.05)
+dim(gg1_2@result[,1:7])
+
+gg1_2@result[1:10,c(2:3,5,7)]
+```
+```{r}
+gseaplot(gg1_2, geneSetID = "hsa03010")
+```
+```{r}
+ridgeplot(gg1_2, label_format = 50, showCategory = 20)
+```
+-> 1 compared to 2 has an enrichment in pathways connected to cell cycle, therefore suggesting a faster proliferation; to p53, therefore suggesting a deregulated apoptosis.
+on the other hand group 2 compared to 1 is enriched in neurorelated pathways, therefore suggesting a more differentiated nature (not shown in the original paper)
+### GSEA kegg 1-3
+
+```{r}
+tt1_3 <- top1_3$logFC
+names(tt1_3) <- universo.entrez1_3
+
+tt1_3<-tt1_3[!duplicated(names(tt1_3))]
+
+gg1_3 <- gseKEGG(geneList = sort(tt1_3, decreasing = TRUE),
+              organism = "hsa",
+              minGSSize = 10,
+              pvalueCutoff = 0.05)
+dim(gg1_3@result[,1:7])
+
+gg1_3@result[1:10,c(2:3,5,7)]
+```
+```{r}
+gseaplot(gg1_3, geneSetID = "hsa05150")
+```
+
+```{r}
+ridgeplot(gg1_3, label_format = 50, showCategory = 20)
+```
+-> 1 compared to 3 seems to have a downregulation of immune-related pathways (not showed in the original paper)
+
+### GSEA kegg 1-4
+
+```{r}
+tt1_4 <- top1_4$logFC
+names(tt1_4) <- universo.entrez1_4
+
+tt1_4<-tt1_4[!duplicated(names(tt1_4))]
+
+gg1_4 <- gseKEGG(geneList = sort(tt1_4, decreasing = TRUE),
+              organism = "hsa",
+              minGSSize = 10,
+              pvalueCutoff = 0.05)
+dim(gg1_4@result[,1:7])
+
+gg1_4@result[1:10,c(2:3,5,7)]
+```
+```{r}
+gseaplot(gg1_4, geneSetID = "hsa03010")
+```
+
+```{r}
+ridgeplot(gg1_4, label_format = 50, showCategory = 20)
+```
+-> 1 compared to 4 seems to have a down-regulation of immune related pathways; in focal adhesion and ECM-receptors interaction, therefore suggesting a higher metastatic potential
+### GSEA kegg 2-3
+
+```{r}
+tt2_3 <- top2_3$logFC
+names(tt2_3) <- universo.entrez2_3
+
+tt2_3<-tt2_3[!duplicated(names(tt2_3))]
+
+gg2_3<- gseKEGG(geneList = sort(tt2_3, decreasing = TRUE),
+              organism = "hsa",
+              minGSSize = 10,
+              pvalueCutoff = 0.05)
+dim(gg2_3@result[,1:7])
+
+gg2_3@result[1:10,c(2:3,5,7)]
+```
+```{r}
+ridgeplot(gg2_3, label_format = 50, showCategory = 20)
+```
+-> 2 compared to 3 is enriched in neuronal pathways, suggesting a more differentiated nature. group 3 compared to 2 is on the other hand enriched in immune related pathways
+
+
+```{r}
+gseaplot(gg2_3, geneSetID = "hsa03010")
+```
+
+
+
+### GSEA kegg 2-4
+
+```{r}
+tt2_4 <- top2_4$logFC
+names(tt2_4) <- universo.entrez2_4
+
+tt2_4<-tt2_4[!duplicated(names(tt2_4))]
+
+gg2_4<- gseKEGG(geneList = sort(tt2_4, decreasing = TRUE),
+              organism = "hsa",
+              minGSSize = 10,
+              pvalueCutoff = 0.05)
+dim(gg2_4@result[,1:7])
+
+gg2_4@result[1:10,c(2:3,5,7)]
+```
+```{r}
+gseaplot(gg2_4, geneSetID = "hsa04721")
+```
+
+
+```{r}
+ridgeplot(gg2_4, label_format = 50, showCategory = 20)
+```
+-> 2 compared to 4 is enriched in neuronal pathways, suggesting a less differentiated nature.
+
+### GSEA kegg 3-4
+
+```{r}
+tt3_4 <- top3_4$logFC
+names(tt3_4) <- universo.entrez3_4
+
+tt3_4<-tt3_4[!duplicated(names(tt3_4))]
+
+gg3_4 <- gseKEGG(geneList = sort(tt3_4, decreasing = TRUE),
+              organism = "hsa",
+              minGSSize = 10,
+              pvalueCutoff = 0.05)
+dim(gg3_4@result[,1:7])
+
+gg3_4@result[1:10,c(2:3,5,7)]
+```
+```{r}
+gseaplot(gg2_4, geneSetID = "hsa04510")
+```
+```{r}
+ridgeplot(gg3_4, label_format = 50, showCategory = 20)
+```
+-< group 3 compared to 4 seems to have immune-related pathways less expressed.
+NB: this output is the less reasonable.
+
+
+## GSEA GO 1-2
+
+```{r}
+ggGO1_2 <- gseGO(
+          geneList=sort(tt1_2, decreasing = TRUE),
+          ont = "BP",
+          OrgDb='org.Hs.eg.db',
+          keyType = "ENTREZID",
+          exponent = 1,
+          #nPerm = 10000,
+          minGSSize = 10,
+          maxGSSize = 500,
+          pvalueCutoff = 0.02,
+          pAdjustMethod = "BH",
+          seed = FALSE,
+          by = "fgsea"
+          )
+
+dim(ggGO1_2@result)
+
+ggGO1_2@result[1:10,c(2:3, 5,7)]
+```
+```{r}
+ridgeplot(ggGO1_2, label_format = 50, showCategory = 12)
+```
+-> 1 compared to 2 has pathways involved with erroneous chromosomes/chromatids segregation upregulated, therefore suggesting frequent errors in cell division.
+-> not present in the original paper
+### GSEA GO1-3
+
+```{r}
+ggGO1_3 <- gseGO(
+          geneList=sort(tt1_3, decreasing = TRUE),
+          ont = "BP",
+          OrgDb='org.Hs.eg.db',
+          keyType = "ENTREZID",
+          exponent = 1,
+          #nPerm = 10000,
+          minGSSize = 10,
+          maxGSSize = 500,
+          pvalueCutoff = 0.02,
+          pAdjustMethod = "BH",
+          seed = FALSE,
+          by = "fgsea"
+          )
+
+dim(ggGO1_3@result)
+
+ggGO1_3@result[1:10,c(2:3, 5,7)]
+```
+
+```{r}
+ridgeplot(ggGO1_3, label_format = 50, showCategory = 15)
+```
+-> 1 compared to 3 has a downregulation of pathwyas involved with immune response.
+### GSEA GO 1-4
+
+```{r}
+ggGO1_4 <- gseGO(
+          geneList=sort(tt1_4, decreasing = TRUE),
+          ont = "BP",
+          OrgDb='org.Hs.eg.db',
+          keyType = "ENTREZID",
+          exponent = 1,
+          #nPerm = 10000,
+          minGSSize = 10,
+          maxGSSize = 500,
+          pvalueCutoff = 0.02,
+          pAdjustMethod = "BH",
+          seed = FALSE,
+          by = "fgsea"
+          )
+
+dim(ggGO1_4@result)
+
+ggGO1_4@result[1:10,c(2:3, 5,7)]
+```
+
+```{r}
+ridgeplot(ggGO1_4, label_format = 50, showCategory = 15)
+```
+-> 1 compared to 4 is downregulated in pathways linked with immune responses/functions
+### GSEA GO2-3
+```{r}
+ggGO2_3 <- gseGO(
+          geneList=sort(tt2_3, decreasing = TRUE),
+          ont = "BP",
+          OrgDb='org.Hs.eg.db',
+          keyType = "ENTREZID",
+          exponent = 1,
+          #nPerm = 10000,
+          minGSSize = 10,
+          maxGSSize = 500,
+          pvalueCutoff = 0.02,
+          pAdjustMethod = "BH",
+          seed = FALSE,
+          by = "fgsea"
+          )
+
+dim(ggGO2_3@result)
+
+ggGO2_3@result[1:10,c(2:3, 5,7)]
+```
+
+```{r}
+ridgeplot(ggGO2_3, label_format = 50, showCategory = 15)
+```
+-> 2 compared to 3 is downregulated in pathwyas linked with immune responses/functions
+
+### GSEA GO 2-4
+
+```{r}
+ggGO2_4 <- gseGO(
+          geneList=sort(tt2_4, decreasing = TRUE),
+          ont = "BP",
+          OrgDb='org.Hs.eg.db',
+          keyType = "ENTREZID",
+          exponent = 1,
+          #nPerm = 10000,
+          minGSSize = 10,
+          maxGSSize = 500,
+          pvalueCutoff = 0.02,
+          pAdjustMethod = "BH",
+          seed = FALSE,
+          by = "fgsea"
+          )
+
+dim(ggGO2_4@result)
+
+ggGO2_4@result[1:10,c(2:3, 5,7)]
+```
+
+```{r}
+ridgeplot(ggGO2_4, label_format = 50, showCategory = 15)
+```
+-< 2 compared to 4 is upregulated in neural/neuronal pathwyas,therefore suggesting a less differentiated nature
+### GSEA GO 3-4
+```{r}
+ggGO3_4 <- gseGO(
+          geneList=sort(tt3_4, decreasing = TRUE),
+          ont = "BP",
+          OrgDb='org.Hs.eg.db',
+          keyType = "ENTREZID",
+          exponent = 1,
+          #nPerm = 10000,
+          minGSSize = 10,
+          maxGSSize = 500,
+          pvalueCutoff = 0.02,
+          pAdjustMethod = "BH",
+          seed = FALSE,
+          by = "fgsea"
+          )
+
+dim(ggGO3_4@result)
+
+ggGO3_4@result[1:10,c(2:3, 5,7)]
+```
+
+```{r}
+ridgeplot(ggGO3_4, label_format = 50, showCategory = 15)
+```
+-> 3 compared to 4 has an upregulation of pathwyas linked to protein synthesis and RNA processing; on the other hand is downregulated in apthways involved in angiogenesis and metastatizaion/invasiveness
+
+### CORRELATION WITH IDH status
+
+```{r}
+data_1 <- as.data.frame(table(as.data.frame(colData(lgg))[,c(81,102)]))
+
+ggplot(data_1, aes(fill = paper_Pan.Glioma.RNA.Expression.Cluster,
+              y = Freq,
+              x = paper_IDH.status)) + 
+    geom_bar(position="fill", stat="identity")
+```
+
+
