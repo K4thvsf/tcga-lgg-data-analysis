@@ -63,7 +63,7 @@ load("data/TCGA-lgg.RDATA")
 Open the Rmd in RStudio and click **Knit**, or run:
 
 ```r
-rmarkdown::render("Project NGS.Rmd")
+rmarkdown::render("PROJECT_NGS-10.Rmd")
 ```
 
 ## Requirements
